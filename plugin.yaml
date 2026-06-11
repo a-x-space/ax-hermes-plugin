@@ -1,0 +1,25 @@
+name: ax
+label: ax
+kind: platform
+version: 0.1.0
+description: >
+  ax gateway platform plugin for Hermes Agent. It binds a local Hermes gateway
+  to an ax account and receives agent requests over an outbound WebSocket.
+author: ax
+optional_env:
+  - name: AX_SERVER_URL
+    description: "ax runtime plugin server URL (default http://8.153.200.8:8787)"
+    prompt: "ax server URL"
+    password: false
+  - name: AX_INSTALLATION_ID
+    description: "ax installation id, normally written by `hermes ax bind`"
+    prompt: "ax installation id"
+    password: false
+  - name: AX_DEVICE_TOKEN
+    description: "ax device token, normally written by `hermes ax bind`"
+    prompt: "ax device token"
+    password: true
+  - name: AX_HOME_CHANNEL
+    description: "Default ax target for cron or notification delivery"
+    prompt: "ax home channel"
+    password: false

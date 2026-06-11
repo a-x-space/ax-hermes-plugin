@@ -1,0 +1,20 @@
+{
+  "name": "@ax/hermes-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hermes Agent platform plugin for binding a local Hermes gateway to ax.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "pack:runtime": "node scripts/pack-runtime.mjs"
+  },
+  "files": [
+    "plugin.yaml",
+    "__init__.py",
+    "adapter.py",
+    "cli.py",
+    "storage.py",
+    "README.md",
+    "after-install.md"
+  ]
+}
