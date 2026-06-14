@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 try:
     import aiohttp
@@ -26,6 +27,19 @@ from .storage import PLUGIN_VERSION, clear_credentials, resolve_credentials, res
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 16000
+AX_TOOL_EVENT_PREFIX = "__ax_tool_event__:"
+STREAM_MESSAGE_PREFIX = "hstream"
+TOOL_MESSAGE_PREFIX = "htool"
+
+STREAM_CAPABILITIES = [
+    "agent.request",
+    "agent.started",
+    "agent.done",
+    "agent.delta",
+    "agent.input_required",
+    "agent.tool.started",
+    "agent.tool.completed",
+]
 
 
 def check_requirements() -> bool:
@@ -56,6 +70,8 @@ class AxAdapter(BasePlatformAdapter):
     """Bidirectional bridge between ax and a local Hermes gateway."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    SUPPORTS_MESSAGE_EDITING = True
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("ax"))
@@ -70,6 +86,13 @@ class AxAdapter(BasePlatformAdapter):
         self._status_task: Optional[asyncio.Task] = None
         self._closing = False
         self._request_by_chat_id: Dict[str, str] = {}
+        self._last_request_by_chat_id: Dict[str, str] = {}
+        self._sequence_by_request_id: Dict[str, int] = {}
+        self._stream_text_by_request_id: Dict[str, str] = {}
+        self._completed_request_ids: Set[str] = set()
+        self._last_edit_text_by_message_id: Dict[str, str] = {}
+        self._pending_done_tasks: Dict[str, asyncio.Task] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def connect(self) -> bool:
         if not AIOHTTP_AVAILABLE:
@@ -79,6 +102,7 @@ class AxAdapter(BasePlatformAdapter):
             logger.warning("[ax] not bound. Run: hermes ax bind")
             return False
         self._closing = False
+        self._loop = asyncio.get_running_loop()
         self._session = aiohttp.ClientSession()
         self._runner_task = asyncio.create_task(self._run_forever())
         logger.info("[ax] connecting to %s", self._server_url)
@@ -89,12 +113,17 @@ class AxAdapter(BasePlatformAdapter):
         for task in (self._status_task, self._runner_task):
             if task and not task.done():
                 task.cancel()
+        for task in self._pending_done_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._pending_done_tasks.clear()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
             await self._session.close()
         self._ws = None
         self._session = None
+        self._loop = None
         self._mark_disconnected()
 
     async def send(
@@ -104,21 +133,162 @@ class AxAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        del reply_to, metadata
-        request_id = self._request_by_chat_id.pop(chat_id, None) or chat_id.replace("ax:", "", 1)
-        payload = {
-            "type": "agent.done",
-            "messageId": _message_id("hmsg"),
-            "requestId": request_id,
-            "message": {"text": content},
-            "completedAt": _now_iso(),
-        }
+        del reply_to
+        metadata = metadata or {}
+        request_id = self._request_id_for_chat(chat_id)
         try:
-            await self._send_json(payload)
-            return SendResult(success=True, message_id=payload["messageId"])
+            tool_event = _decode_tool_event(content)
+            if tool_event:
+                message_id = await self._send_tool_event(chat_id, tool_event)
+                return SendResult(success=True, message_id=message_id)
+
+            if metadata.get("expect_edits"):
+                if _looks_like_streaming_preview(content):
+                    message_id = await self._send_stream_delta(chat_id, content, accumulated=True)
+                    return SendResult(success=True, message_id=message_id or _stream_message_id(request_id))
+                await self._send_stream_delta(chat_id, content, accumulated=True)
+                self._schedule_done(chat_id, request_id, content)
+                return SendResult(success=True, message_id=_stream_message_id(request_id))
+
+            if self._is_active_chat(chat_id) and not metadata.get("notify"):
+                tool_event = _tool_event_from_progress_text(content)
+                if tool_event:
+                    message_id = await self._send_tool_event(chat_id, tool_event)
+                    return SendResult(success=True, message_id=message_id)
+                message_id = await self._send_stream_delta(chat_id, content, accumulated=False)
+                return SendResult(success=True, message_id=message_id or _stream_message_id(request_id))
+
+            if request_id in self._completed_request_ids:
+                return SendResult(success=True, message_id=_message_id("hdup"))
+            message_id = await self._send_done(chat_id, content)
+            return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.warning("[ax] send failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del metadata
+        try:
+            tool_event = _decode_tool_event(content)
+            if not tool_event and _is_tool_message_id(message_id):
+                tool_event = _tool_event_from_progress_text(content)
+            if _is_tool_message_id(message_id) or tool_event:
+                if content != self._last_edit_text_by_message_id.get(message_id):
+                    self._last_edit_text_by_message_id[message_id] = content
+                    if tool_event:
+                        await self._send_tool_event(chat_id, tool_event)
+                return SendResult(success=True, message_id=message_id)
+
+            if finalize:
+                request_id = self._request_id_for_chat(chat_id)
+                await self._send_stream_delta(chat_id, content, accumulated=True, cancel_pending=False)
+                self._schedule_done(chat_id, request_id, content)
+                return SendResult(success=True, message_id=_stream_message_id(request_id))
+
+            delta_message_id = await self._send_stream_delta(chat_id, content, accumulated=True)
+            return SendResult(success=True, message_id=delta_message_id or message_id)
+        except Exception as exc:
+            logger.warning("[ax] edit failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del session_key, metadata
+        prefix = getattr(self, "typed_command_prefix", "/") or "/"
+        cmd_preview = command[:200] + "..." if len(command) > 200 else command
+        prompt = (
+            "⚠️ **Dangerous command requires approval:**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            f"Reply `{prefix}approve` to execute, `{prefix}approve session` to approve this pattern "
+            f"for the session, `{prefix}approve always` to approve permanently, or `{prefix}deny` to cancel."
+        )
+        return await self._send_input_required(
+            chat_id,
+            prompt,
+            kind="exec_approval",
+            commands=[
+                f"{prefix}approve",
+                f"{prefix}approve session",
+                f"{prefix}approve always",
+                f"{prefix}deny",
+            ],
+        )
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del title, session_key, confirm_id, metadata
+        prefix = getattr(self, "typed_command_prefix", "/") or "/"
+        return await self._send_input_required(
+            chat_id,
+            message,
+            kind="slash_confirm",
+            commands=[f"{prefix}approve", f"{prefix}always", f"{prefix}cancel"],
+        )
+
+    def render_message_event(self, event: Any, sink: Any) -> None:
+        """Map Hermes structured text events to AX live delta frames."""
+        chat_id = str(getattr(sink, "chat_id", "") or "")
+        if not chat_id:
+            return
+        event_name = type(event).__name__
+        text = str(getattr(event, "text", "") or "")
+        if event_name in {"MessageChunk", "Commentary"} and text:
+            self._schedule_stream_delta(chat_id, text)
+
+    def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
+        """Encode Hermes structured tool events for send_progress_messages."""
+        del mode
+        event_name = type(event).__name__
+        tool_name = str(getattr(event, "tool_name", "") or "")
+        if not tool_name:
+            return None
+        if event_name == "ToolCallChunk":
+            preview = str(getattr(event, "preview", "") or "")
+            if preview and preview_max_len > 0 and len(preview) > preview_max_len:
+                preview = preview[: max(0, preview_max_len - 3)] + "..."
+            return AX_TOOL_EVENT_PREFIX + json.dumps(
+                {
+                    "event": "started",
+                    "tool": tool_name,
+                    "preview": preview,
+                },
+                separators=(",", ":"),
+            )
+        if event_name == "ToolCallFinished":
+            duration = float(getattr(event, "duration", 0.0) or 0.0)
+            ok = bool(getattr(event, "ok", True))
+            return AX_TOOL_EVENT_PREFIX + json.dumps(
+                {
+                    "event": "completed",
+                    "tool": tool_name,
+                    "durationMs": int(duration * 1000),
+                    "error": not ok,
+                },
+                separators=(",", ":"),
+            )
+        return None
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"chat_id": chat_id, "name": chat_id, "type": "dm"}
@@ -197,6 +367,10 @@ class AxAdapter(BasePlatformAdapter):
             return
         chat_id = f"ax:{message.get('conversationId') or request_id}"
         self._request_by_chat_id[chat_id] = request_id
+        self._last_request_by_chat_id[chat_id] = request_id
+        self._sequence_by_request_id[request_id] = 0
+        self._stream_text_by_request_id[request_id] = ""
+        self._completed_request_ids.discard(request_id)
         await self._send_json(
             {
                 "type": "agent.started",
@@ -248,7 +422,7 @@ class AxAdapter(BasePlatformAdapter):
                 "messageId": _message_id("hhello"),
                 "installationId": self._installation_id,
                 "pluginVersion": PLUGIN_VERSION,
-                "capabilities": ["agent.request", "agent.done"],
+                "capabilities": STREAM_CAPABILITIES,
                 "sentAt": _now_iso(),
             }
         )
@@ -257,6 +431,204 @@ class AxAdapter(BasePlatformAdapter):
         if not self._ws or self._ws.closed:
             raise RuntimeError("ax websocket is not connected")
         await self._ws.send_str(json.dumps(payload, separators=(",", ":")))
+
+    def _request_id_for_chat(self, chat_id: str) -> str:
+        return (
+            self._request_by_chat_id.get(chat_id)
+            or self._last_request_by_chat_id.get(chat_id)
+            or chat_id.replace("ax:", "", 1)
+        )
+
+    def _is_active_chat(self, chat_id: str) -> bool:
+        return chat_id in self._request_by_chat_id
+
+    def _next_sequence(self, request_id: str) -> int:
+        sequence = self._sequence_by_request_id.get(request_id, 0) + 1
+        self._sequence_by_request_id[request_id] = sequence
+        return sequence
+
+    async def _send_stream_delta(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        accumulated: bool,
+        cancel_pending: bool = True,
+    ) -> Optional[str]:
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return None
+        if cancel_pending:
+            self._cancel_pending_done(request_id)
+        clean_content = _strip_stream_cursor(content)
+        if accumulated:
+            previous = self._stream_text_by_request_id.get(request_id, "")
+            delta = _delta_from_accumulated(previous, clean_content)
+            self._stream_text_by_request_id[request_id] = clean_content
+        else:
+            delta = clean_content
+            self._stream_text_by_request_id[request_id] = (
+                self._stream_text_by_request_id.get(request_id, "") + clean_content
+            )
+        if not delta:
+            return None
+        payload = {
+            "type": "agent.delta",
+            "messageId": _message_id("hdelta"),
+            "requestId": request_id,
+            "sequence": self._next_sequence(request_id),
+            "delta": delta,
+            "sentAt": _now_iso(),
+        }
+        await self._send_json(payload)
+        return _stream_message_id(request_id)
+
+    async def _send_input_required(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        kind: str,
+        commands: list[str],
+    ) -> SendResult:
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return SendResult(success=True, message_id=_message_id("hdup"))
+        self._cancel_pending_done(request_id)
+        payload: Dict[str, Any] = {
+            "type": "agent.input_required",
+            "messageId": _message_id("hinput"),
+            "requestId": request_id,
+            "kind": kind,
+            "prompt": prompt,
+            "commands": commands,
+            "sentAt": _now_iso(),
+        }
+        await self._send_json(payload)
+        return SendResult(success=True, message_id=payload["messageId"])
+
+    def _schedule_stream_delta(self, chat_id: str, content: str) -> None:
+        if not content:
+            return
+        self._schedule_coro(self._send_stream_delta(chat_id, content, accumulated=False))
+
+    async def _send_tool_event(self, chat_id: str, event: Dict[str, Any]) -> str:
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return _tool_message_id(request_id)
+        self._cancel_pending_done(request_id)
+        kind = str(event.get("event") or "started")
+        tool = str(event.get("tool") or "tool")
+        if kind == "completed":
+            payload = {
+                "type": "agent.tool.completed",
+                "messageId": _message_id("htooldone"),
+                "requestId": request_id,
+                "sequence": self._next_sequence(request_id),
+                "tool": tool,
+                "durationMs": int(event.get("durationMs") or 0),
+                "error": bool(event.get("error")),
+                "sentAt": _now_iso(),
+            }
+        else:
+            payload = {
+                "type": "agent.tool.started",
+                "messageId": _message_id("htoolstart"),
+                "requestId": request_id,
+                "sequence": self._next_sequence(request_id),
+                "tool": tool,
+                "sentAt": _now_iso(),
+            }
+            preview = str(event.get("preview") or "").strip()
+            if preview:
+                payload["preview"] = preview[:240]
+        await self._send_json(payload)
+        return _tool_message_id(request_id)
+
+    async def _send_done(self, chat_id: str, content: str, *, cancel_pending: bool = True) -> str:
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return _message_id("hdup")
+        if cancel_pending:
+            self._cancel_pending_done(request_id)
+        payload = {
+            "type": "agent.done",
+            "messageId": _message_id("hmsg"),
+            "requestId": request_id,
+            "message": {"text": _strip_stream_cursor(content)},
+            "completedAt": _now_iso(),
+        }
+        await self._send_json(payload)
+        self._complete_request(chat_id, request_id)
+        return payload["messageId"]
+
+    def _complete_request(self, chat_id: str, request_id: str) -> None:
+        if self._request_by_chat_id.get(chat_id) == request_id:
+            self._request_by_chat_id.pop(chat_id, None)
+        self._last_request_by_chat_id[chat_id] = request_id
+        self._completed_request_ids.add(request_id)
+        self._sequence_by_request_id.pop(request_id, None)
+        self._stream_text_by_request_id.pop(request_id, None)
+        self._cancel_pending_done(request_id)
+
+    def _schedule_done(self, chat_id: str, request_id: str, content: str) -> None:
+        self._cancel_pending_done(request_id)
+        loop = self._loop
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if not loop or loop.is_closed():
+            loop = running_loop
+        if not loop or not loop.is_running():
+            logger.debug("[ax] dropping delayed done: event loop is not running")
+            return
+
+        async def _delayed_done() -> None:
+            try:
+                await asyncio.sleep(1.0)
+                if request_id not in self._completed_request_ids:
+                    self._pending_done_tasks.pop(request_id, None)
+                    await self._send_done(chat_id, content, cancel_pending=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[ax] delayed done failed: %s", exc)
+
+        if running_loop is loop:
+            task = loop.create_task(_delayed_done())
+        else:
+            task = asyncio.run_coroutine_threadsafe(_delayed_done(), loop)
+        self._pending_done_tasks[request_id] = task
+
+    def _cancel_pending_done(self, request_id: str) -> None:
+        task = self._pending_done_tasks.pop(request_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _schedule_coro(self, coro: Any) -> None:
+        loop = self._loop
+        if not loop or loop.is_closed():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                coro.close()
+                logger.debug("[ax] dropping stream event: no running event loop")
+                return
+        if loop.is_running():
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is loop:
+                task = loop.create_task(coro)
+                task.add_done_callback(_log_future_exception)
+            else:
+                future = asyncio.run_coroutine_threadsafe(coro, loop)
+                future.add_done_callback(_log_future_exception)
+            return
+        coro.close()
+        logger.debug("[ax] dropping stream event: event loop is not running")
 
 
 def register(ctx) -> None:
@@ -322,3 +694,88 @@ def _message_id(prefix: str) -> str:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _stream_message_id(request_id: str) -> str:
+    return f"{STREAM_MESSAGE_PREFIX}_{request_id}"
+
+
+def _tool_message_id(request_id: str) -> str:
+    return f"{TOOL_MESSAGE_PREFIX}_{request_id}"
+
+
+def _is_tool_message_id(message_id: str) -> bool:
+    return str(message_id or "").startswith(f"{TOOL_MESSAGE_PREFIX}_")
+
+
+def _decode_tool_event(content: str) -> Optional[Dict[str, Any]]:
+    text = str(content or "").strip()
+    if not text.startswith(AX_TOOL_EVENT_PREFIX):
+        return None
+    try:
+        decoded = json.loads(text[len(AX_TOOL_EVENT_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _tool_event_from_progress_text(content: str) -> Optional[Dict[str, Any]]:
+    text = str(content or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        return {"event": "started", "tool": "terminal", "preview": _preview_from_text(text)}
+    first_line = text.splitlines()[0].strip()
+    parts = first_line.split(maxsplit=1)
+    if not parts:
+        return None
+    candidate = first_line
+    if len(parts) > 1 and not parts[0][:1].isalnum():
+        candidate = parts[1].strip()
+    match = re.match(r"([A-Za-z][A-Za-z0-9_.-]{0,80})(?:\(|:|\.{3}|\s|$)", candidate)
+    if not match:
+        return None
+    tool = match.group(1)
+    preview = ""
+    if ":" in candidate:
+        preview = candidate.split(":", 1)[1].strip().strip("\"'")
+    return {"event": "started", "tool": tool, "preview": preview[:240]}
+
+
+def _preview_from_text(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip("`").strip()]
+    return " ".join(lines)[:240]
+
+
+def _looks_like_streaming_preview(content: str) -> bool:
+    text = str(content or "")
+    return text.endswith("\u2589") or text.endswith("\u2588")
+
+
+def _strip_stream_cursor(content: str) -> str:
+    text = str(content or "")
+    while text.endswith("\u2589") or text.endswith("\u2588"):
+        text = text[:-1]
+    return text
+
+
+def _delta_from_accumulated(previous: str, current: str) -> str:
+    if not current:
+        return ""
+    if current.startswith(previous):
+        return current[len(previous) :]
+    if previous.endswith(current):
+        return ""
+    return current
+
+
+def _log_future_exception(future: Any) -> None:
+    try:
+        exc = future.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception as err:
+        logger.debug("[ax] stream event failed: %s", err)
+        return
+    if exc:
+        logger.debug("[ax] stream event failed: %s", exc)
