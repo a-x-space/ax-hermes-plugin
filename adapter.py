@@ -455,7 +455,7 @@ class AxAdapter(BasePlatformAdapter):
         mode = _stream_delta_mode(accumulated)
         if accumulated is True:
             self._snapshot_text_by_request_id[request_id] = clean_content
-            logger.info(
+            logger.debug(
                 "[ax] defer snapshot request=%s mode=%s current_len=%d streamed=%s current_sig=%s",
                 request_id,
                 mode,
@@ -471,7 +471,7 @@ class AxAdapter(BasePlatformAdapter):
             delta, next_text = _delta_from_unknown_stream_update(previous, clean_content)
         self._stream_text_by_request_id[request_id] = next_text
         if not delta:
-            logger.info(
+            logger.debug(
                 "[ax] skip delta request=%s mode=%s previous_len=%d current_len=%d total_len=%d current_sig=%s total_sig=%s",
                 request_id,
                 mode,
@@ -491,7 +491,7 @@ class AxAdapter(BasePlatformAdapter):
             "delta": delta,
             "sentAt": _now_iso(),
         }
-        logger.info(
+        logger.debug(
             "[ax] send delta request=%s seq=%d mode=%s delta_len=%d current_len=%d total_len=%d delta_sig=%s current_sig=%s total_sig=%s",
             request_id,
             sequence,
