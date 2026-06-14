@@ -155,7 +155,7 @@ class AxAdapter(BasePlatformAdapter):
                 if tool_event:
                     message_id = await self._send_tool_event(chat_id, tool_event)
                     return SendResult(success=True, message_id=message_id)
-                message_id = await self._send_stream_delta(chat_id, content, accumulated=False)
+                message_id = await self._send_stream_delta(chat_id, content, accumulated=None)
                 return SendResult(success=True, message_id=message_id or _stream_message_id(request_id))
 
             if request_id in self._completed_request_ids:
@@ -452,7 +452,7 @@ class AxAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         *,
-        accumulated: bool,
+        accumulated: Optional[bool],
         cancel_pending: bool = True,
     ) -> Optional[str]:
         request_id = self._request_id_for_chat(chat_id)
@@ -461,15 +461,14 @@ class AxAdapter(BasePlatformAdapter):
         if cancel_pending:
             self._cancel_pending_done(request_id)
         clean_content = _strip_stream_cursor(content)
-        if accumulated:
-            previous = self._stream_text_by_request_id.get(request_id, "")
-            delta = _delta_from_accumulated(previous, clean_content)
-            self._stream_text_by_request_id[request_id] = clean_content
+        previous = self._stream_text_by_request_id.get(request_id, "")
+        if accumulated is True:
+            delta, next_text = _delta_from_accumulated(previous, clean_content)
+        elif accumulated is False:
+            delta, next_text = clean_content, previous + clean_content
         else:
-            delta = clean_content
-            self._stream_text_by_request_id[request_id] = (
-                self._stream_text_by_request_id.get(request_id, "") + clean_content
-            )
+            delta, next_text = _delta_from_unknown_stream_update(previous, clean_content)
+        self._stream_text_by_request_id[request_id] = next_text
         if not delta:
             return None
         payload = {
@@ -759,14 +758,60 @@ def _strip_stream_cursor(content: str) -> str:
     return text
 
 
-def _delta_from_accumulated(previous: str, current: str) -> str:
+def _delta_from_accumulated(previous: str, current: str) -> tuple[str, str]:
     if not current:
-        return ""
+        return "", previous
+    if not previous:
+        return current, current
+    if current == previous or previous.endswith(current):
+        return "", previous
     if current.startswith(previous):
-        return current[len(previous) :]
-    if previous.endswith(current):
-        return ""
-    return current
+        return current[len(previous) :], current
+    return "", previous
+
+
+def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
+    if not current:
+        return "", previous
+    if not previous:
+        return current, current
+    if current == previous:
+        return "", previous
+    if current.startswith(previous):
+        return current[len(previous) :], current
+    if _looks_like_replayed_snapshot(previous, current):
+        return "", previous
+    overlap = _suffix_prefix_overlap(previous, current)
+    if overlap >= 8:
+        delta = current[overlap:]
+        return delta, previous + delta
+    return current, previous + current
+
+
+def _looks_like_replayed_snapshot(previous: str, current: str) -> bool:
+    if len(current) < 16:
+        return False
+    if current in previous or previous.endswith(current):
+        return True
+    common = _common_prefix_len(previous, current)
+    shorter = min(len(previous), len(current))
+    return shorter >= 16 and common / shorter >= 0.75
+
+
+def _common_prefix_len(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def _suffix_prefix_overlap(left: str, right: str) -> int:
+    max_size = min(len(left), len(right))
+    for size in range(max_size, 0, -1):
+        if left.endswith(right[:size]):
+            return size
+    return 0
 
 
 def _log_future_exception(future: Any) -> None:
