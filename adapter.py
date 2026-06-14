@@ -456,21 +456,24 @@ class AxAdapter(BasePlatformAdapter):
         if cancel_pending:
             self._cancel_pending_done(request_id)
         clean_content = _strip_stream_cursor(content)
-        previous = self._stream_text_by_request_id.get(request_id, "")
+        mode = _stream_delta_mode(accumulated)
         if accumulated is True:
-            previous_snapshot = self._snapshot_text_by_request_id.get(request_id, "")
-            delta, next_text, next_snapshot = _delta_from_accumulated_snapshot(
-                previous,
-                previous_snapshot,
-                clean_content,
+            self._snapshot_text_by_request_id[request_id] = clean_content
+            logger.info(
+                "[ax] defer snapshot request=%s mode=%s current_len=%d streamed=%s current_sig=%s",
+                request_id,
+                mode,
+                len(clean_content),
+                request_id in self._delta_sent_request_ids,
+                _text_sig(clean_content),
             )
-            self._snapshot_text_by_request_id[request_id] = next_snapshot
-        elif accumulated is False:
+            return None
+        previous = self._stream_text_by_request_id.get(request_id, "")
+        if accumulated is False:
             delta, next_text = clean_content, previous + clean_content
         else:
             delta, next_text = _delta_from_unknown_stream_update(previous, clean_content)
         self._stream_text_by_request_id[request_id] = next_text
-        mode = _stream_delta_mode(accumulated)
         if not delta:
             logger.info(
                 "[ax] skip delta request=%s mode=%s previous_len=%d current_len=%d total_len=%d current_sig=%s total_sig=%s",
@@ -807,25 +810,6 @@ def _stream_delta_mode(accumulated: Optional[bool]) -> str:
 
 def _text_sig(text: str) -> str:
     return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:12]
-
-
-def _delta_from_accumulated_snapshot(
-    emitted: str,
-    previous_snapshot: str,
-    current: str,
-) -> tuple[str, str, str]:
-    if not current:
-        return "", emitted, previous_snapshot
-    if current == previous_snapshot:
-        return "", emitted, current
-    if not emitted:
-        if previous_snapshot and current.startswith(previous_snapshot):
-            return current, current, current
-        return "", emitted, current
-    if current.startswith(emitted):
-        delta = current[len(emitted) :]
-        return delta, current, current
-    return "", emitted, current
 
 
 def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
