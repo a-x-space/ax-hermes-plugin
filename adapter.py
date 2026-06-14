@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -89,6 +90,9 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id: Dict[str, str] = {}
         self._sequence_by_request_id: Dict[str, int] = {}
         self._stream_text_by_request_id: Dict[str, str] = {}
+        self._consumer_delta_text_by_request_id: Dict[str, str] = {}
+        self._snapshot_text_by_request_id: Dict[str, str] = {}
+        self._delta_sent_request_ids: Set[str] = set()
         self._completed_request_ids: Set[str] = set()
         self._last_edit_text_by_message_id: Dict[str, str] = {}
         self._pending_done_tasks: Dict[str, asyncio.Task] = {}
@@ -103,6 +107,7 @@ class AxAdapter(BasePlatformAdapter):
             return False
         self._closing = False
         self._loop = asyncio.get_running_loop()
+        _install_stream_consumer_delta_hook()
         self._session = aiohttp.ClientSession()
         self._runner_task = asyncio.create_task(self._run_forever())
         logger.info("[ax] connecting to %s", self._server_url)
@@ -143,11 +148,7 @@ class AxAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=message_id)
 
             if metadata.get("expect_edits"):
-                if _looks_like_streaming_preview(content):
-                    message_id = await self._send_stream_delta(chat_id, content, accumulated=True)
-                    return SendResult(success=True, message_id=message_id or _stream_message_id(request_id))
                 await self._send_stream_delta(chat_id, content, accumulated=True)
-                self._schedule_done(chat_id, request_id, content)
                 return SendResult(success=True, message_id=_stream_message_id(request_id))
 
             if self._is_active_chat(chat_id) and not metadata.get("notify"):
@@ -246,16 +247,6 @@ class AxAdapter(BasePlatformAdapter):
             kind="slash_confirm",
             commands=[f"{prefix}approve", f"{prefix}always", f"{prefix}cancel"],
         )
-
-    def render_message_event(self, event: Any, sink: Any) -> None:
-        """Map Hermes structured text events to AX live delta frames."""
-        chat_id = str(getattr(sink, "chat_id", "") or "")
-        if not chat_id:
-            return
-        event_name = type(event).__name__
-        text = str(getattr(event, "text", "") or "")
-        if event_name in {"MessageChunk", "Commentary"} and text:
-            self._schedule_stream_delta(chat_id, text)
 
     def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
         """Encode Hermes structured tool events for send_progress_messages."""
@@ -370,6 +361,9 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id[chat_id] = request_id
         self._sequence_by_request_id[request_id] = 0
         self._stream_text_by_request_id[request_id] = ""
+        self._consumer_delta_text_by_request_id[request_id] = ""
+        self._snapshot_text_by_request_id[request_id] = ""
+        self._delta_sent_request_ids.discard(request_id)
         self._completed_request_ids.discard(request_id)
         await self._send_json(
             {
@@ -461,26 +455,104 @@ class AxAdapter(BasePlatformAdapter):
         if cancel_pending:
             self._cancel_pending_done(request_id)
         clean_content = _strip_stream_cursor(content)
-        previous = self._stream_text_by_request_id.get(request_id, "")
+        mode = _stream_delta_mode(accumulated)
         if accumulated is True:
-            delta, next_text = _delta_from_accumulated(previous, clean_content)
-        elif accumulated is False:
+            message_id = await self._flush_consumer_stream_delta(request_id)
+            self._snapshot_text_by_request_id[request_id] = clean_content
+            logger.debug(
+                "[ax] defer snapshot request=%s mode=%s current_len=%d streamed=%s current_sig=%s",
+                request_id,
+                mode,
+                len(clean_content),
+                request_id in self._delta_sent_request_ids,
+                _text_sig(clean_content),
+            )
+            return message_id
+        previous = self._stream_text_by_request_id.get(request_id, "")
+        if accumulated is False:
             delta, next_text = clean_content, previous + clean_content
         else:
             delta, next_text = _delta_from_unknown_stream_update(previous, clean_content)
         self._stream_text_by_request_id[request_id] = next_text
         if not delta:
+            logger.debug(
+                "[ax] skip delta request=%s mode=%s previous_len=%d current_len=%d total_len=%d current_sig=%s total_sig=%s",
+                request_id,
+                mode,
+                len(previous),
+                len(clean_content),
+                len(next_text),
+                _text_sig(clean_content),
+                _text_sig(next_text),
+            )
             return None
+        await self._send_delta_frame(
+            request_id,
+            delta,
+            mode=mode,
+            current_text=clean_content,
+            next_text=next_text,
+        )
+        return _stream_message_id(request_id)
+
+    async def _flush_consumer_stream_delta(self, request_id: str) -> Optional[str]:
+        delta = self._consumer_delta_text_by_request_id.pop(request_id, "")
+        if not delta:
+            return None
+        previous = self._stream_text_by_request_id.get(request_id, "")
+        next_text = previous + delta
+        self._stream_text_by_request_id[request_id] = next_text
+        await self._send_delta_frame(
+            request_id,
+            delta,
+            mode="consumer",
+            current_text=delta,
+            next_text=next_text,
+        )
+        return _stream_message_id(request_id)
+
+    async def _send_delta_frame(
+        self,
+        request_id: str,
+        delta: str,
+        *,
+        mode: str,
+        current_text: str,
+        next_text: str,
+    ) -> None:
+        sequence = self._next_sequence(request_id)
         payload = {
             "type": "agent.delta",
             "messageId": _message_id("hdelta"),
             "requestId": request_id,
-            "sequence": self._next_sequence(request_id),
+            "sequence": sequence,
             "delta": delta,
             "sentAt": _now_iso(),
         }
+        logger.debug(
+            "[ax] send delta request=%s seq=%d mode=%s delta_len=%d current_len=%d total_len=%d delta_sig=%s current_sig=%s total_sig=%s",
+            request_id,
+            sequence,
+            mode,
+            len(delta),
+            len(current_text),
+            len(next_text),
+            _text_sig(delta),
+            _text_sig(current_text),
+            _text_sig(next_text),
+        )
         await self._send_json(payload)
-        return _stream_message_id(request_id)
+        self._delta_sent_request_ids.add(request_id)
+
+    def _buffer_consumer_stream_delta(self, chat_id: str, delta: str) -> None:
+        if not delta:
+            return
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return
+        self._consumer_delta_text_by_request_id[request_id] = (
+            self._consumer_delta_text_by_request_id.get(request_id, "") + delta
+        )
 
     async def _send_input_required(
         self,
@@ -544,8 +616,15 @@ class AxAdapter(BasePlatformAdapter):
         await self._send_json(payload)
         return _tool_message_id(request_id)
 
-    async def _send_done(self, chat_id: str, content: str, *, cancel_pending: bool = True) -> str:
-        request_id = self._request_id_for_chat(chat_id)
+    async def _send_done(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        request_id: Optional[str] = None,
+        cancel_pending: bool = True,
+    ) -> str:
+        request_id = request_id or self._request_id_for_chat(chat_id)
         if request_id in self._completed_request_ids:
             return _message_id("hdup")
         if cancel_pending:
@@ -554,9 +633,20 @@ class AxAdapter(BasePlatformAdapter):
             "type": "agent.done",
             "messageId": _message_id("hmsg"),
             "requestId": request_id,
-            "message": {"text": _strip_stream_cursor(content)},
             "completedAt": _now_iso(),
         }
+        if request_id in self._delta_sent_request_ids:
+            logger.debug("[ax] completing streamed request %s without replaying final text", request_id)
+        else:
+            payload["message"] = {"text": _strip_stream_cursor(content)}
+        logger.info(
+            "[ax] send done request=%s streamed=%s has_message=%s content_len=%d content_sig=%s",
+            request_id,
+            request_id in self._delta_sent_request_ids,
+            "message" in payload,
+            len(_strip_stream_cursor(content)),
+            _text_sig(_strip_stream_cursor(content)),
+        )
         await self._send_json(payload)
         self._complete_request(chat_id, request_id)
         return payload["messageId"]
@@ -568,6 +658,9 @@ class AxAdapter(BasePlatformAdapter):
         self._completed_request_ids.add(request_id)
         self._sequence_by_request_id.pop(request_id, None)
         self._stream_text_by_request_id.pop(request_id, None)
+        self._consumer_delta_text_by_request_id.pop(request_id, None)
+        self._snapshot_text_by_request_id.pop(request_id, None)
+        self._delta_sent_request_ids.discard(request_id)
         self._cancel_pending_done(request_id)
 
     def _schedule_done(self, chat_id: str, request_id: str, content: str) -> None:
@@ -588,7 +681,7 @@ class AxAdapter(BasePlatformAdapter):
                 await asyncio.sleep(1.0)
                 if request_id not in self._completed_request_ids:
                     self._pending_done_tasks.pop(request_id, None)
-                    await self._send_done(chat_id, content, cancel_pending=False)
+                    await self._send_done(chat_id, content, request_id=request_id, cancel_pending=False)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -758,16 +851,16 @@ def _strip_stream_cursor(content: str) -> str:
     return text
 
 
-def _delta_from_accumulated(previous: str, current: str) -> tuple[str, str]:
-    if not current:
-        return "", previous
-    if not previous:
-        return current, current
-    if current == previous or previous.endswith(current):
-        return "", previous
-    if current.startswith(previous):
-        return current[len(previous) :], current
-    return "", previous
+def _stream_delta_mode(accumulated: Optional[bool]) -> str:
+    if accumulated is True:
+        return "snapshot"
+    if accumulated is False:
+        return "delta"
+    return "unknown"
+
+
+def _text_sig(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:12]
 
 
 def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
@@ -793,6 +886,8 @@ def _looks_like_replayed_snapshot(previous: str, current: str) -> bool:
         return False
     if current in previous or previous.endswith(current):
         return True
+    if len(current) > len(previous):
+        return False
     common = _common_prefix_len(previous, current)
     shorter = min(len(previous), len(current))
     return shorter >= 16 and common / shorter >= 0.75
@@ -812,6 +907,52 @@ def _suffix_prefix_overlap(left: str, right: str) -> int:
         if left.endswith(right[:size]):
             return size
     return 0
+
+
+def _install_stream_consumer_delta_hook() -> None:
+    try:
+        from gateway.stream_consumer import GatewayStreamConsumer
+    except Exception as exc:
+        logger.debug("[ax] stream consumer delta hook unavailable: %s", exc)
+        return
+
+    if getattr(GatewayStreamConsumer, "_ax_delta_hook_installed", False):
+        return
+
+    original_filter = GatewayStreamConsumer._filter_and_accumulate
+    original_flush = GatewayStreamConsumer._flush_think_buffer
+
+    def _patched_filter_and_accumulate(consumer: Any, text: str) -> None:
+        before = str(getattr(consumer, "_accumulated", "") or "")
+        original_filter(consumer, text)
+        _notify_consumer_delta(consumer, before)
+
+    def _patched_flush_think_buffer(consumer: Any) -> None:
+        before = str(getattr(consumer, "_accumulated", "") or "")
+        original_flush(consumer)
+        _notify_consumer_delta(consumer, before)
+
+    GatewayStreamConsumer._filter_and_accumulate = _patched_filter_and_accumulate
+    GatewayStreamConsumer._flush_think_buffer = _patched_flush_think_buffer
+    GatewayStreamConsumer._ax_delta_hook_installed = True
+    logger.debug("[ax] installed GatewayStreamConsumer delta hook")
+
+
+def _notify_consumer_delta(consumer: Any, previous_text: str) -> None:
+    current_text = str(getattr(consumer, "_accumulated", "") or "")
+    if not current_text.startswith(previous_text):
+        return
+    delta = current_text[len(previous_text) :]
+    if not delta:
+        return
+    adapter = getattr(consumer, "adapter", None)
+    callback = getattr(adapter, "_buffer_consumer_stream_delta", None)
+    if not callable(callback):
+        return
+    try:
+        callback(str(getattr(consumer, "chat_id", "") or ""), delta)
+    except Exception:
+        logger.debug("[ax] consumer delta callback failed", exc_info=True)
 
 
 def _log_future_exception(future: Any) -> None:
