@@ -763,11 +763,22 @@ def _delta_from_accumulated(previous: str, current: str) -> tuple[str, str]:
         return "", previous
     if not previous:
         return current, current
-    if current == previous or previous.endswith(current):
+    if current == previous or current in previous or previous.endswith(current):
         return "", previous
     if current.startswith(previous):
         return current[len(previous) :], current
-    return "", previous
+    overlap = _suffix_prefix_overlap(previous, current)
+    if overlap >= 8:
+        delta = current[overlap:]
+        return delta, previous + delta
+    common = _common_prefix_len(previous, current)
+    if common >= 8:
+        delta = current[common:]
+        if delta:
+            return delta, previous + delta
+    if _looks_like_replayed_snapshot(previous, current):
+        return "", previous
+    return current, previous + current
 
 
 def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
@@ -793,6 +804,8 @@ def _looks_like_replayed_snapshot(previous: str, current: str) -> bool:
         return False
     if current in previous or previous.endswith(current):
         return True
+    if len(current) > len(previous):
+        return False
     common = _common_prefix_len(previous, current)
     shorter = min(len(previous), len(current))
     return shorter >= 16 and common / shorter >= 0.75
