@@ -819,7 +819,9 @@ def _delta_from_accumulated_snapshot(
     if current == previous_snapshot:
         return "", emitted, current
     if not emitted:
-        return current, current, current
+        if previous_snapshot and current.startswith(previous_snapshot):
+            return current, current, current
+        return "", emitted, current
     if current.startswith(emitted):
         delta = current[len(emitted) :]
         return delta, current, current
