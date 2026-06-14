@@ -71,7 +71,7 @@ class AxAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     SUPPORTS_MESSAGE_EDITING = True
-    REQUIRES_EDIT_FINALIZE = True
+    REQUIRES_EDIT_FINALIZE = False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("ax"))
@@ -89,7 +89,7 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id: Dict[str, str] = {}
         self._sequence_by_request_id: Dict[str, int] = {}
         self._stream_text_by_request_id: Dict[str, str] = {}
-        self._message_chunk_seen_request_ids: Set[str] = set()
+        self._delta_sent_request_ids: Set[str] = set()
         self._completed_request_ids: Set[str] = set()
         self._last_edit_text_by_message_id: Dict[str, str] = {}
         self._pending_done_tasks: Dict[str, asyncio.Task] = {}
@@ -248,18 +248,6 @@ class AxAdapter(BasePlatformAdapter):
             commands=[f"{prefix}approve", f"{prefix}always", f"{prefix}cancel"],
         )
 
-    def render_message_event(self, event: Any, sink: Any) -> None:
-        """Map Hermes structured text events to AX live delta frames."""
-        chat_id = str(getattr(sink, "chat_id", "") or "")
-        if not chat_id:
-            return
-        event_name = type(event).__name__
-        text = str(getattr(event, "text", "") or "")
-        if event_name == "MessageChunk" and text:
-            self._schedule_stream_delta(chat_id, text, from_message_chunk=True)
-        elif event_name == "Commentary" and text:
-            self._schedule_stream_delta(chat_id, text)
-
     def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
         """Encode Hermes structured tool events for send_progress_messages."""
         del mode
@@ -373,7 +361,7 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id[chat_id] = request_id
         self._sequence_by_request_id[request_id] = 0
         self._stream_text_by_request_id[request_id] = ""
-        self._message_chunk_seen_request_ids.discard(request_id)
+        self._delta_sent_request_ids.discard(request_id)
         self._completed_request_ids.discard(request_id)
         await self._send_json(
             {
@@ -458,22 +446,16 @@ class AxAdapter(BasePlatformAdapter):
         *,
         accumulated: Optional[bool],
         cancel_pending: bool = True,
-        from_message_chunk: bool = False,
     ) -> Optional[str]:
         request_id = self._request_id_for_chat(chat_id)
         if request_id in self._completed_request_ids:
             return None
-        if from_message_chunk:
-            self._message_chunk_seen_request_ids.add(request_id)
         if cancel_pending:
             self._cancel_pending_done(request_id)
         clean_content = _strip_stream_cursor(content)
         previous = self._stream_text_by_request_id.get(request_id, "")
         if accumulated is True:
-            if request_id in self._message_chunk_seen_request_ids:
-                delta, next_text = _delta_from_snapshot_after_chunks(previous, clean_content)
-            else:
-                delta, next_text = _delta_from_accumulated(previous, clean_content)
+            delta, next_text = _delta_from_accumulated(previous, clean_content)
         elif accumulated is False:
             delta, next_text = clean_content, previous + clean_content
         else:
@@ -490,6 +472,7 @@ class AxAdapter(BasePlatformAdapter):
             "sentAt": _now_iso(),
         }
         await self._send_json(payload)
+        self._delta_sent_request_ids.add(request_id)
         return _stream_message_id(request_id)
 
     async def _send_input_required(
@@ -516,23 +499,10 @@ class AxAdapter(BasePlatformAdapter):
         await self._send_json(payload)
         return SendResult(success=True, message_id=payload["messageId"])
 
-    def _schedule_stream_delta(
-        self,
-        chat_id: str,
-        content: str,
-        *,
-        from_message_chunk: bool = False,
-    ) -> None:
+    def _schedule_stream_delta(self, chat_id: str, content: str) -> None:
         if not content:
             return
-        self._schedule_coro(
-            self._send_stream_delta(
-                chat_id,
-                content,
-                accumulated=False,
-                from_message_chunk=from_message_chunk,
-            )
-        )
+        self._schedule_coro(self._send_stream_delta(chat_id, content, accumulated=False))
 
     async def _send_tool_event(self, chat_id: str, event: Dict[str, Any]) -> str:
         request_id = self._request_id_for_chat(chat_id)
@@ -577,9 +547,12 @@ class AxAdapter(BasePlatformAdapter):
             "type": "agent.done",
             "messageId": _message_id("hmsg"),
             "requestId": request_id,
-            "message": {"text": _strip_stream_cursor(content)},
             "completedAt": _now_iso(),
         }
+        if request_id in self._delta_sent_request_ids:
+            logger.debug("[ax] completing streamed request %s without replaying final text", request_id)
+        else:
+            payload["message"] = {"text": _strip_stream_cursor(content)}
         await self._send_json(payload)
         self._complete_request(chat_id, request_id)
         return payload["messageId"]
@@ -591,7 +564,7 @@ class AxAdapter(BasePlatformAdapter):
         self._completed_request_ids.add(request_id)
         self._sequence_by_request_id.pop(request_id, None)
         self._stream_text_by_request_id.pop(request_id, None)
-        self._message_chunk_seen_request_ids.discard(request_id)
+        self._delta_sent_request_ids.discard(request_id)
         self._cancel_pending_done(request_id)
 
     def _schedule_done(self, chat_id: str, request_id: str, content: str) -> None:
@@ -803,20 +776,6 @@ def _delta_from_accumulated(previous: str, current: str) -> tuple[str, str]:
     if _looks_like_replayed_snapshot(previous, current):
         return "", previous
     return current, previous + current
-
-
-def _delta_from_snapshot_after_chunks(previous: str, current: str) -> tuple[str, str]:
-    if not current:
-        return "", previous
-    if not previous:
-        return current, current
-    if current == previous or current in previous or previous.startswith(current):
-        return "", previous
-    if current.startswith(previous):
-        return current[len(previous) :], current
-    # Once native MessageChunk deltas are flowing, a non-prefix snapshot is a
-    # rewrite of text AX has already appended. Replaying it would duplicate.
-    return "", previous
 
 
 def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
