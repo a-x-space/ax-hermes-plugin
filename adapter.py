@@ -68,6 +68,15 @@ def env_enablement() -> Optional[dict]:
     return result
 
 
+def _mark_clarify_awaiting_text(clarify_id: str) -> None:
+    try:
+        from tools.clarify_gateway import mark_awaiting_text
+
+        mark_awaiting_text(clarify_id)
+    except Exception:
+        logger.debug("[ax] failed to mark clarify as awaiting text", exc_info=True)
+
+
 class AxAdapter(BasePlatformAdapter):
     """Bidirectional bridge between ax and a local Hermes gateway."""
 
@@ -236,6 +245,11 @@ class AxAdapter(BasePlatformAdapter):
             ],
         )
 
+    # Hermes blocks the agent thread while these prompts wait for the user's
+    # next message. On AX they must close the current request with
+    # agent.input_required; sending them as a normal delta leaves the frontend
+    # waiting for a terminal event that will not arrive until after the user
+    # answers.
     async def send_slash_confirm(
         self,
         chat_id: str,
@@ -252,6 +266,43 @@ class AxAdapter(BasePlatformAdapter):
             message,
             kind="slash_confirm",
             commands=[f"{prefix}approve", f"{prefix}always", f"{prefix}cancel"],
+        )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del session_key, metadata
+        clean_question = str(question or "").strip()
+        clean_choices = [str(choice).strip() for choice in (choices or []) if str(choice).strip()]
+
+        if clean_choices:
+            _mark_clarify_awaiting_text(clarify_id)
+            lines = [f"❓ {clean_question}", ""]
+            for index, choice in enumerate(clean_choices, start=1):
+                lines.append(f"{index}. {choice}")
+            lines.append("")
+            lines.append("回复选项序号、选项内容，或直接输入你的答案。")
+            prompt = "\n".join(lines)
+            commands = [str(index) for index in range(1, len(clean_choices) + 1)]
+        else:
+            prompt = f"❓ {clean_question}"
+            commands = []
+
+        return await self._send_input_required(
+            chat_id,
+            prompt,
+            kind="clarify",
+            commands=commands,
+            details={
+                "clarifyId": clarify_id,
+                "choices": clean_choices,
+            },
         )
 
     def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
@@ -567,6 +618,7 @@ class AxAdapter(BasePlatformAdapter):
         *,
         kind: str,
         commands: list[str],
+        details: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         request_id = self._request_id_for_chat(chat_id)
         if request_id in self._completed_request_ids:
@@ -581,6 +633,15 @@ class AxAdapter(BasePlatformAdapter):
             "commands": commands,
             "sentAt": _now_iso(),
         }
+        if details:
+            payload.update(details)
+        logger.info(
+            "[ax] request input request=%s kind=%s commands=%d prompt_len=%d",
+            request_id,
+            kind,
+            len(commands),
+            len(prompt),
+        )
         await self._send_json(payload)
         return SendResult(success=True, message_id=payload["messageId"])
 
