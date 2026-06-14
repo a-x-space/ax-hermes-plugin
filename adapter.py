@@ -72,7 +72,7 @@ class AxAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     SUPPORTS_MESSAGE_EDITING = True
-    REQUIRES_EDIT_FINALIZE = False
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("ax"))
@@ -146,11 +146,7 @@ class AxAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=message_id)
 
             if metadata.get("expect_edits"):
-                if _looks_like_streaming_preview(content):
-                    message_id = await self._send_stream_delta(chat_id, content, accumulated=True)
-                    return SendResult(success=True, message_id=message_id or _stream_message_id(request_id))
                 await self._send_stream_delta(chat_id, content, accumulated=True)
-                self._schedule_done(chat_id, request_id, content)
                 return SendResult(success=True, message_id=_stream_message_id(request_id))
 
             if self._is_active_chat(chat_id) and not metadata.get("notify"):
@@ -573,8 +569,15 @@ class AxAdapter(BasePlatformAdapter):
         await self._send_json(payload)
         return _tool_message_id(request_id)
 
-    async def _send_done(self, chat_id: str, content: str, *, cancel_pending: bool = True) -> str:
-        request_id = self._request_id_for_chat(chat_id)
+    async def _send_done(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        request_id: Optional[str] = None,
+        cancel_pending: bool = True,
+    ) -> str:
+        request_id = request_id or self._request_id_for_chat(chat_id)
         if request_id in self._completed_request_ids:
             return _message_id("hdup")
         if cancel_pending:
@@ -630,7 +633,7 @@ class AxAdapter(BasePlatformAdapter):
                 await asyncio.sleep(1.0)
                 if request_id not in self._completed_request_ids:
                     self._pending_done_tasks.pop(request_id, None)
-                    await self._send_done(chat_id, content, cancel_pending=False)
+                    await self._send_done(chat_id, content, request_id=request_id, cancel_pending=False)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
