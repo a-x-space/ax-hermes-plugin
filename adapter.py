@@ -36,6 +36,7 @@ STREAM_CAPABILITIES = [
     "agent.started",
     "agent.done",
     "agent.delta",
+    "agent.input_required",
     "agent.tool.started",
     "agent.tool.completed",
 ]
@@ -197,6 +198,54 @@ class AxAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[ax] edit failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del session_key, metadata
+        prefix = getattr(self, "typed_command_prefix", "/") or "/"
+        cmd_preview = command[:200] + "..." if len(command) > 200 else command
+        prompt = (
+            "⚠️ **Dangerous command requires approval:**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            f"Reply `{prefix}approve` to execute, `{prefix}approve session` to approve this pattern "
+            f"for the session, `{prefix}approve always` to approve permanently, or `{prefix}deny` to cancel."
+        )
+        return await self._send_input_required(
+            chat_id,
+            prompt,
+            kind="exec_approval",
+            commands=[
+                f"{prefix}approve",
+                f"{prefix}approve session",
+                f"{prefix}approve always",
+                f"{prefix}deny",
+            ],
+        )
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del title, session_key, confirm_id, metadata
+        prefix = getattr(self, "typed_command_prefix", "/") or "/"
+        return await self._send_input_required(
+            chat_id,
+            message,
+            kind="slash_confirm",
+            commands=[f"{prefix}approve", f"{prefix}always", f"{prefix}cancel"],
+        )
 
     def render_message_event(self, event: Any, sink: Any) -> None:
         """Map Hermes structured text events to AX live delta frames."""
@@ -433,6 +482,30 @@ class AxAdapter(BasePlatformAdapter):
         }
         await self._send_json(payload)
         return _stream_message_id(request_id)
+
+    async def _send_input_required(
+        self,
+        chat_id: str,
+        prompt: str,
+        *,
+        kind: str,
+        commands: list[str],
+    ) -> SendResult:
+        request_id = self._request_id_for_chat(chat_id)
+        if request_id in self._completed_request_ids:
+            return SendResult(success=True, message_id=_message_id("hdup"))
+        self._cancel_pending_done(request_id)
+        payload: Dict[str, Any] = {
+            "type": "agent.input_required",
+            "messageId": _message_id("hinput"),
+            "requestId": request_id,
+            "kind": kind,
+            "prompt": prompt,
+            "commands": commands,
+            "sentAt": _now_iso(),
+        }
+        await self._send_json(payload)
+        return SendResult(success=True, message_id=payload["messageId"])
 
     def _schedule_stream_delta(self, chat_id: str, content: str) -> None:
         if not content:
