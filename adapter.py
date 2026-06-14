@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -89,6 +90,7 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id: Dict[str, str] = {}
         self._sequence_by_request_id: Dict[str, int] = {}
         self._stream_text_by_request_id: Dict[str, str] = {}
+        self._snapshot_text_by_request_id: Dict[str, str] = {}
         self._delta_sent_request_ids: Set[str] = set()
         self._completed_request_ids: Set[str] = set()
         self._last_edit_text_by_message_id: Dict[str, str] = {}
@@ -361,6 +363,7 @@ class AxAdapter(BasePlatformAdapter):
         self._last_request_by_chat_id[chat_id] = request_id
         self._sequence_by_request_id[request_id] = 0
         self._stream_text_by_request_id[request_id] = ""
+        self._snapshot_text_by_request_id[request_id] = ""
         self._delta_sent_request_ids.discard(request_id)
         self._completed_request_ids.discard(request_id)
         await self._send_json(
@@ -455,22 +458,52 @@ class AxAdapter(BasePlatformAdapter):
         clean_content = _strip_stream_cursor(content)
         previous = self._stream_text_by_request_id.get(request_id, "")
         if accumulated is True:
-            delta, next_text = _delta_from_accumulated(previous, clean_content)
+            previous_snapshot = self._snapshot_text_by_request_id.get(request_id, "")
+            delta, next_text, next_snapshot = _delta_from_accumulated_snapshot(
+                previous,
+                previous_snapshot,
+                clean_content,
+            )
+            self._snapshot_text_by_request_id[request_id] = next_snapshot
         elif accumulated is False:
             delta, next_text = clean_content, previous + clean_content
         else:
             delta, next_text = _delta_from_unknown_stream_update(previous, clean_content)
         self._stream_text_by_request_id[request_id] = next_text
+        mode = _stream_delta_mode(accumulated)
         if not delta:
+            logger.info(
+                "[ax] skip delta request=%s mode=%s previous_len=%d current_len=%d total_len=%d current_sig=%s total_sig=%s",
+                request_id,
+                mode,
+                len(previous),
+                len(clean_content),
+                len(next_text),
+                _text_sig(clean_content),
+                _text_sig(next_text),
+            )
             return None
+        sequence = self._next_sequence(request_id)
         payload = {
             "type": "agent.delta",
             "messageId": _message_id("hdelta"),
             "requestId": request_id,
-            "sequence": self._next_sequence(request_id),
+            "sequence": sequence,
             "delta": delta,
             "sentAt": _now_iso(),
         }
+        logger.info(
+            "[ax] send delta request=%s seq=%d mode=%s delta_len=%d current_len=%d total_len=%d delta_sig=%s current_sig=%s total_sig=%s",
+            request_id,
+            sequence,
+            mode,
+            len(delta),
+            len(clean_content),
+            len(next_text),
+            _text_sig(delta),
+            _text_sig(clean_content),
+            _text_sig(next_text),
+        )
         await self._send_json(payload)
         self._delta_sent_request_ids.add(request_id)
         return _stream_message_id(request_id)
@@ -553,6 +586,14 @@ class AxAdapter(BasePlatformAdapter):
             logger.debug("[ax] completing streamed request %s without replaying final text", request_id)
         else:
             payload["message"] = {"text": _strip_stream_cursor(content)}
+        logger.info(
+            "[ax] send done request=%s streamed=%s has_message=%s content_len=%d content_sig=%s",
+            request_id,
+            request_id in self._delta_sent_request_ids,
+            "message" in payload,
+            len(_strip_stream_cursor(content)),
+            _text_sig(_strip_stream_cursor(content)),
+        )
         await self._send_json(payload)
         self._complete_request(chat_id, request_id)
         return payload["messageId"]
@@ -564,6 +605,7 @@ class AxAdapter(BasePlatformAdapter):
         self._completed_request_ids.add(request_id)
         self._sequence_by_request_id.pop(request_id, None)
         self._stream_text_by_request_id.pop(request_id, None)
+        self._snapshot_text_by_request_id.pop(request_id, None)
         self._delta_sent_request_ids.discard(request_id)
         self._cancel_pending_done(request_id)
 
@@ -755,27 +797,33 @@ def _strip_stream_cursor(content: str) -> str:
     return text
 
 
-def _delta_from_accumulated(previous: str, current: str) -> tuple[str, str]:
+def _stream_delta_mode(accumulated: Optional[bool]) -> str:
+    if accumulated is True:
+        return "snapshot"
+    if accumulated is False:
+        return "delta"
+    return "unknown"
+
+
+def _text_sig(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _delta_from_accumulated_snapshot(
+    emitted: str,
+    previous_snapshot: str,
+    current: str,
+) -> tuple[str, str, str]:
     if not current:
-        return "", previous
-    if not previous:
-        return current, current
-    if current == previous or current in previous or previous.endswith(current):
-        return "", previous
-    if current.startswith(previous):
-        return current[len(previous) :], current
-    overlap = _suffix_prefix_overlap(previous, current)
-    if overlap >= 8:
-        delta = current[overlap:]
-        return delta, previous + delta
-    common = _common_prefix_len(previous, current)
-    if common >= 8:
-        delta = current[common:]
-        if delta:
-            return delta, previous + delta
-    if _looks_like_replayed_snapshot(previous, current):
-        return "", previous
-    return current, previous + current
+        return "", emitted, previous_snapshot
+    if current == previous_snapshot:
+        return "", emitted, current
+    if not emitted:
+        return current, current, current
+    if current.startswith(emitted):
+        delta = current[len(emitted) :]
+        return delta, current, current
+    return "", emitted, current
 
 
 def _delta_from_unknown_stream_update(previous: str, current: str) -> tuple[str, str]:
