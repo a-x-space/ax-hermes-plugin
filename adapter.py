@@ -31,6 +31,7 @@ MAX_MESSAGE_LENGTH = 16000
 AX_TOOL_EVENT_PREFIX = "__ax_tool_event__:"
 STREAM_MESSAGE_PREFIX = "hstream"
 TOOL_MESSAGE_PREFIX = "htool"
+AX_TURN_FINAL_METADATA_KEY = "_ax_turn_final"
 
 STREAM_CAPABILITIES = [
     "agent.request",
@@ -149,6 +150,8 @@ class AxAdapter(BasePlatformAdapter):
 
             if metadata.get("expect_edits"):
                 await self._send_stream_delta(chat_id, content, accumulated=True)
+                if metadata.get(AX_TURN_FINAL_METADATA_KEY):
+                    self._schedule_done(chat_id, request_id, content)
                 return SendResult(success=True, message_id=_stream_message_id(request_id))
 
             if self._is_active_chat(chat_id) and not metadata.get("notify"):
@@ -176,7 +179,7 @@ class AxAdapter(BasePlatformAdapter):
         finalize: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        del metadata
+        metadata = metadata or {}
         try:
             tool_event = _decode_tool_event(content)
             if not tool_event and _is_tool_message_id(message_id):
@@ -191,7 +194,10 @@ class AxAdapter(BasePlatformAdapter):
             if finalize:
                 request_id = self._request_id_for_chat(chat_id)
                 await self._send_stream_delta(chat_id, content, accumulated=True, cancel_pending=False)
-                self._schedule_done(chat_id, request_id, content)
+                if metadata.get(AX_TURN_FINAL_METADATA_KEY):
+                    self._schedule_done(chat_id, request_id, content)
+                else:
+                    logger.debug("[ax] skip done for non-final stream segment request=%s", request_id)
                 return SendResult(success=True, message_id=_stream_message_id(request_id))
 
             delta_message_id = await self._send_stream_delta(chat_id, content, accumulated=True)
@@ -916,26 +922,57 @@ def _install_stream_consumer_delta_hook() -> None:
         logger.debug("[ax] stream consumer delta hook unavailable: %s", exc)
         return
 
-    if getattr(GatewayStreamConsumer, "_ax_delta_hook_installed", False):
-        return
+    if not getattr(GatewayStreamConsumer, "_ax_delta_hook_installed", False):
+        original_filter = GatewayStreamConsumer._filter_and_accumulate
+        original_flush = GatewayStreamConsumer._flush_think_buffer
 
-    original_filter = GatewayStreamConsumer._filter_and_accumulate
-    original_flush = GatewayStreamConsumer._flush_think_buffer
+        def _patched_filter_and_accumulate(consumer: Any, text: str) -> None:
+            before = str(getattr(consumer, "_accumulated", "") or "")
+            original_filter(consumer, text)
+            _notify_consumer_delta(consumer, before)
 
-    def _patched_filter_and_accumulate(consumer: Any, text: str) -> None:
-        before = str(getattr(consumer, "_accumulated", "") or "")
-        original_filter(consumer, text)
-        _notify_consumer_delta(consumer, before)
+        def _patched_flush_think_buffer(consumer: Any) -> None:
+            before = str(getattr(consumer, "_accumulated", "") or "")
+            original_flush(consumer)
+            _notify_consumer_delta(consumer, before)
 
-    def _patched_flush_think_buffer(consumer: Any) -> None:
-        before = str(getattr(consumer, "_accumulated", "") or "")
-        original_flush(consumer)
-        _notify_consumer_delta(consumer, before)
+        GatewayStreamConsumer._filter_and_accumulate = _patched_filter_and_accumulate
+        GatewayStreamConsumer._flush_think_buffer = _patched_flush_think_buffer
+        GatewayStreamConsumer._ax_delta_hook_installed = True
+        logger.debug("[ax] installed GatewayStreamConsumer delta hook")
 
-    GatewayStreamConsumer._filter_and_accumulate = _patched_filter_and_accumulate
-    GatewayStreamConsumer._flush_think_buffer = _patched_flush_think_buffer
-    GatewayStreamConsumer._ax_delta_hook_installed = True
-    logger.debug("[ax] installed GatewayStreamConsumer delta hook")
+    if not getattr(GatewayStreamConsumer, "_ax_turn_final_hook_installed", False):
+        original_send_or_edit = GatewayStreamConsumer._send_or_edit
+
+        async def _patched_send_or_edit(
+            consumer: Any,
+            text: str,
+            *,
+            finalize: bool = False,
+            is_turn_final: bool = True,
+        ) -> bool:
+            original_metadata = getattr(consumer, "metadata", None)
+            if finalize:
+                try:
+                    metadata = dict(original_metadata or {})
+                except Exception:
+                    metadata = {}
+                metadata[AX_TURN_FINAL_METADATA_KEY] = bool(is_turn_final)
+                setattr(consumer, "metadata", metadata)
+            try:
+                return await original_send_or_edit(
+                    consumer,
+                    text,
+                    finalize=finalize,
+                    is_turn_final=is_turn_final,
+                )
+            finally:
+                if finalize:
+                    setattr(consumer, "metadata", original_metadata)
+
+        GatewayStreamConsumer._send_or_edit = _patched_send_or_edit
+        GatewayStreamConsumer._ax_turn_final_hook_installed = True
+        logger.debug("[ax] installed GatewayStreamConsumer turn-final hook")
 
 
 def _notify_consumer_delta(consumer: Any, previous_text: str) -> None:
